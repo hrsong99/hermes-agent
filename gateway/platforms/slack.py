@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
@@ -680,6 +681,15 @@ class SlackAdapter(BasePlatformAdapter):
                 "hermes_confirm_cancel",
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
+
+            # le_teacher_jp email-secretary learning review buttons.  These
+            # are posted by ~/.hermes/email_assistant/le_teacher_jp/scripts/
+            # slack_learning_threads.py and mark examples/corrections.jsonl.
+            for _action_id in (
+                "le_teacher_correction_approve",
+                "le_teacher_correction_reject",
+            ):
+                self._app.action(_action_id)(self._handle_le_teacher_correction_action)
 
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
@@ -2480,6 +2490,112 @@ class SlackAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.error("Failed to resolve slash-confirm from Slack button: %s", exc, exc_info=True)
+
+    async def _handle_le_teacher_correction_action(self, ack, body, action) -> None:
+        """Handle le_teacher_jp learning candidate approve/reject buttons."""
+        await ack()
+
+        action_id = action.get("action_id", "")
+        raw_index = str(action.get("value", "")).strip()
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized le_teacher correction click by %s (%s) — ignoring",
+                    user_name,
+                    user_id,
+                )
+                return
+
+        try:
+            correction_index = int(raw_index)
+        except Exception:
+            logger.warning("[Slack] Malformed le_teacher correction value: %s", raw_index)
+            return
+
+        status = "approved" if action_id == "le_teacher_correction_approve" else "rejected"
+        note = f"Slack button: {status} by {user_name}"
+        kb_dir = os.getenv(
+            "LE_TEACHER_JP_KB",
+            "/home/ubuntu/.hermes/email_assistant/le_teacher_jp",
+        )
+        py = os.getenv(
+            "HERMES_LE_TEACHER_PYTHON",
+            "/home/ubuntu/.hermes/hermes-agent/venv/bin/python",
+        )
+        cmd = [
+            py,
+            os.path.join(kb_dir, "scripts", "review_corrections.py"),
+            "mark",
+            str(correction_index),
+            status,
+            "--note",
+            note,
+            "--output",
+            "slack",
+        ]
+
+        def _run_mark() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                cmd,
+                cwd=kb_dir,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+
+        proc = await asyncio.to_thread(_run_mark)
+        ok = proc.returncode == 0
+        decision_text = (
+            f"✅ 승인됨 — {user_name}" if status == "approved" else f"❌ 거절됨 — {user_name}"
+        )
+        if not ok:
+            decision_text = f"⚠️ 처리 실패 — {user_name}: {(proc.stdout or '')[-500:]}"
+
+        original_text = ""
+        for block in message.get("blocks", []):
+            if block.get("type") == "section":
+                original_text = block.get("text", {}).get("text", "")
+                break
+
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": original_text or f"학습 후보 #{correction_index}",
+                },
+            },
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": decision_text}]},
+        ]
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=decision_text,
+                blocks=updated_blocks,
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to update le_teacher correction message: %s", e)
+
+        thread_ts = message.get("thread_ts") or msg_ts
+        try:
+            await self._get_client(channel_id).chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=(proc.stdout or decision_text).strip()[:3000],
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to post le_teacher correction follow-up: %s", e)
 
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
