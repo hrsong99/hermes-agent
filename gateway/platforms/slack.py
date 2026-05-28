@@ -688,6 +688,7 @@ class SlackAdapter(BasePlatformAdapter):
             for _action_id in (
                 "le_teacher_correction_approve",
                 "le_teacher_correction_reject",
+                "le_teacher_correction_details",
             ):
                 self._app.action(_action_id)(self._handle_le_teacher_correction_action)
 
@@ -2520,8 +2521,6 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Malformed le_teacher correction value: %s", raw_index)
             return
 
-        status = "approved" if action_id == "le_teacher_correction_approve" else "rejected"
-        note = f"Slack button: {status} by {user_name}"
         kb_dir = os.getenv(
             "LE_TEACHER_JP_KB",
             "/home/ubuntu/.hermes/email_assistant/le_teacher_jp",
@@ -2530,6 +2529,53 @@ class SlackAdapter(BasePlatformAdapter):
             "HERMES_LE_TEACHER_PYTHON",
             "/home/ubuntu/.hermes/hermes-agent/venv/bin/python",
         )
+
+        if action_id == "le_teacher_correction_details":
+            cmd = [
+                py,
+                os.path.join(kb_dir, "scripts", "review_corrections.py"),
+                "show",
+                str(correction_index),
+                "--output",
+                "slack",
+            ]
+
+            def _run_show() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    cmd,
+                    cwd=kb_dir,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=120,
+                    check=False,
+                )
+
+            proc = await asyncio.to_thread(_run_show)
+            detail_text = (proc.stdout or "").strip()[:3000]
+            if proc.returncode != 0:
+                detail_text = f"⚠️ 자세히 보기 실패 — {user_name}: {detail_text[-500:]}"
+            try:
+                await self._get_client(channel_id).chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=detail_text,
+                )
+            except Exception as e:
+                logger.warning("[Slack] Failed to post ephemeral le_teacher correction details: %s", e)
+                thread_ts = message.get("thread_ts") or msg_ts
+                try:
+                    await self._get_client(channel_id).chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        text=detail_text,
+                    )
+                except Exception as post_exc:
+                    logger.warning("[Slack] Failed to post le_teacher correction details: %s", post_exc)
+            return
+
+        status = "approved" if action_id == "le_teacher_correction_approve" else "rejected"
+        note = f"Slack button: {status} by {user_name}"
         cmd = [
             py,
             os.path.join(kb_dir, "scripts", "review_corrections.py"),
